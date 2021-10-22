@@ -1,0 +1,437 @@
+---
+title: "standard processing"
+author: "DB"
+date: "10/17/2021"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(patchwork)
+library(Seurat)
+library(SeuratWrappers)
+library(openxlsx)
+library(sparseMatrixStats)
+theme_set(theme_bw())
+out_dir <- ("results")
+object_dir <- "objects"
+if (!file.exists(out_dir)) {
+  dir.create(out_dir, recursive = T)
+  }
+if (!file.exists(object_dir)) {
+  dir.create(object_dir)
+  }
+
+## functions
+# visualize individual metadata levels in DimPlot
+PlotIndividualClusters <- function(seu, meta.id, nrows = 3, reduction = "umap"){
+  cluster_levels <- levels(as.factor(seu[[meta.id]][, 1]))
+  p <- map(cluster_levels, function(x) {
+    cells <- colnames(seu)[seu[[meta.id]] == x]
+    DimPlot(seu, reduction = reduction, 
+            cells.highlight = cells, sizes.highlight = 0.01) + 
+      NoLegend() + NoAxes() +
+      ggtitle(x) + theme(plot.title = element_text(size = 8, face = "bold"))
+  })
+  wrap_plots(p, nrow = nrows)
+  }
+```
+
+```{r inspect Seurat object}
+seu_l <- readRDS("objects/seu_list.after_preprocessing.Rds")
+# add tissue and HIV status annotation
+hiv_dict <- c("D22_rectum" = "HIV-", "D22_ileum" = "HIV-", 
+              "D23_rectum" = "HIV-", "D23_ileum" = "HIV-", 
+              "D24_rectum" = "HIV+", "D24_ileum" = "HIV+", 
+              "D25_rectum" = "HIV-", "D25_ileum" = "HIV-", 
+              "D26_rectum" = "HIV+", "D26_ileum" = "HIV+", 
+              "D27_rectum" = "HIV+", "D27_ileum" = "HIV+")
+seu_l <- imap(seu_l, function(x, y) {
+  if (grepl("ileum", y)) {
+    x$tissue <- "ileum"
+  } else {
+    x$tissue <- "rectum" 
+  }
+  x$hiv <- hiv_dict[as.character(x$orig.ident)]
+  return(x)
+  })
+
+# pct.mt
+seu_l <- map(seu_l, function(x) {
+  x[["percent.mt"]] <- PercentageFeatureSet(x, pattern = "^MT-")
+  return(x)
+})
+
+bins <- 100
+breaks <- 12
+pdf(file.path(out_dir, "QC", "Histo_QC1_mt.pdf"), width = 10, height = 6)
+iwalk(seu_l, function(x, y) {
+  metadata <- x[[]]
+  p <- ggplot(metadata, aes(x = percent.mt)) + 
+    geom_histogram(bins = bins) +
+    scale_x_continuous(breaks = scales::breaks_extended(breaks)) +
+    ggtitle(paste0(y, " before filtering"))
+  print(p)  
+  cat(y, "- Genes/Cells:", dim(x), "\n")
+  })
+dev.off()
+```
+
+D22_ileum - Genes/Cells: 27322 12573 
+D22_rectum - Genes/Cells: 25734 7984 
+D23_ileum - Genes/Cells: 27565 12760 
+D23_rectum - Genes/Cells: 26893 10909 
+D24_ileum - Genes/Cells: 26872 13704 
+D24_rectum - Genes/Cells: 25962 9449 
+D25_ileum - Genes/Cells: 27212 9568 
+D25_rectum - Genes/Cells: 26811 11176 
+D26_ileum - Genes/Cells: 27386 17941 
+D26_rectum - Genes/Cells: 26896 12435 
+D27_ileum - Genes/Cells: 27356 10405 
+D27_rectum - Genes/Cells: 26864 8108 
+
+```{r filter cells with high pct.mt and remove bad samples}
+# remove samples without low pct mt cells
+bad_samples <- c("D24_rectum")
+seu_l <- seu_l[-which(names(seu_l) %in% bad_samples)]
+n_samples <- length(seu_l)
+
+pct_mt_cutoff <- 15
+pct_mt_filt <- set_names(rep(pct_mt_cutoff, n_samples), nm = names(seu_l))
+pct_mt_filt["D22_ileum"] <- 12
+pct_mt_filt["D23_ileum"] <- 12
+pct_mt_filt["D27_ileum"] <- 12
+
+seu_l <- map2(seu_l, pct_mt_filt, ~ subset(.x, subset = percent.mt < .y))
+
+iwalk(seu_l, ~ cat(.y, "- Genes/Cells:", dim(.x), "\n"))
+```
+
+# dataset integration
+
+```{r integration function}
+integrate_seu <- function(seuList, nfeatures = 3000) {
+  features <- SelectIntegrationFeatures(seuList, nfeatures = 3000)
+  seuList <- PrepSCTIntegration(seuList, anchor.features = features)
+  seu_int_SCT <- FindIntegrationAnchors(seuList, normalization.method = "SCT", 
+                                        anchor.features = features) %>%
+    IntegrateData(., normalization.method = "SCT")
+  seu_int_SCT <- RunPCA(seu_int_SCT)
+}
+```
+
+
+```{r SCT integration of individual tissues: SCTransform}
+seu_l <- map(seu_l, SCTransform, variable.features.n = NULL)
+seu_tissue_l <- list("ileum" = seu_l[grepl("ileum", names(seu_l))],
+                     "rectum" = seu_l[grepl("rectum", names(seu_l))]
+                     )
+saveRDS(seu_tissue_l, file.path(object_dir, "seu_tissue_list.v2.Rds"))
+```
+
+
+```{r SCT integration of individual tissues: integration}
+seu_tissue_int <- map(seu_tissue_l, ~ integrate_seu(.x, nfeatures = 4000))
+iwalk(seu_tissue_int, function(x, y) {
+  p <- ElbowPlot(x, ndims = 50)
+  ggsave(file.path(out_dir, paste0(y, "_ElbowPlot_SCT.pdf")), p)
+  })
+```
+
+```{r save integrated object}
+saveRDS(seu_tissue_int, file.path(object_dir, "seu_tissue_int.v2.Rds"))
+```
+RELOAD object:
+seu_tissue_int <- readRDS("objects/seu_tissue_int.v2.Rds")
+
+```{r SCT integration of individual tissues: cluster & UMAP}
+ndims <- 28
+seu_tissue_int <- map(seu_tissue_int, function(x) {
+  x <- RunUMAP(x, dims = 1:ndims)
+  x <- FindNeighbors(x, dims = 1:ndims)
+  x <- FindClusters(x) 
+  })
+```
+
+```{r change cluster resolution}
+clus_res <- 0.5
+seu_tissue_int <- map(seu_tissue_int, ~ FindClusters(.x, resolution = clus_res))
+```
+
+
+```{r inspect SCT integration}
+# orig.ident, seurat_clusters, hiv
+plot_id <- setNames(nm = c("orig.ident", "seurat_clusters", "hiv"))
+iwalk(seu_tissue_int, function(seu, name) {
+  p <- map(plot_id, ~ DimPlot(seu, group.by = .x, shuffle = T, label = T))
+  ggsave(file.path(out_dir, 
+                   paste0(name, "_tissue.int_DimPlot_QC_clus.res", clus_res, ".pdf")
+                   ), 
+         width = 8, height = 7*length(plot_id),
+         plot = wrap_plots(p, ncol = 1))  
+})
+# percent mt and UMI counts
+iwalk(seu_tissue_int, function(seu, name) {
+  p1 <- DimPlot(seu, group.by = "seurat_clusters", shuffle = T, label = T)
+  p2 <- FeaturePlot(seu, features = "percent.mt")
+  p3 <- FeaturePlot(seu, features = "nCount_RNA", max.cutoff = "q90")
+  ggsave(file.path(out_dir, 
+                   paste0(name, "_tissue.int_pct.mt_nCount.RNA_clus.res", 
+                          clus_res, ".pdf"
+                          )
+                   ),
+         plot = p1 + p2 + p3,
+         width = 18, height = 6
+         )
+  })
+# cluster use by sample 
+summary <- map(seu_tissue_int, function(seu) {
+  seu[[]] %>%
+    group_by(orig.ident, seurat_clusters) %>%
+    summarize(count = n()) %>%
+    pivot_wider(values_from = count, names_from = orig.ident, values_fill = 0)
+  }) 
+write.xlsx(summary, 
+           file.path(out_dir, 
+                     paste0("summary_clusters_tissue.int_clus.res", clus_res, ".xlsx")
+                     ),
+           overwrite = T
+           )
+```
+
+
+```{r annotation with marker genes}
+# DotPlot
+features <- list("stem cells" = c("LGR5","LGR4","OLFM4", "ASCL2", "SOX9",
+                                  "GNB2L1", "EEF1B2", "EEF1A1", "C1QBP"),
+                 "TA cells" = c("HELLS", "PCNA", "KRT18", "CCND2",
+                                "G0S2", "SAA2", "PDZK1IP1"),
+                 "secretory TA" = c("TOP2A", "CCNB1", "UBE2S"),
+                 "cycling TA" = c("MKI67", "CENPF", "NPM1", "HIST1H4C", "AKAP12"),
+                 "enterocytes" = c("ALPI", "FABP1", "KRT19", "KRT20", 
+                                   "CA2", "ANPEP", "VIL1"),
+                 "enterocytes 1" = c("GUCA2A", "FABP6", "CA4", "CEACAM7", "SLC40A1",
+                                     "SLC26A3", "APOA1", "APOB", "RBP2", "ALDOB"),
+                 "enterocytes 2" = c("MUC1", "CLCA4", "MUC13", "LAMA3", "ABCB1"),
+                 "immature enterocytes 1" = c("INSIG1", "CKB", "NEAT1", "SCD", "PHGR1"),
+                 "immature enterocytes 2" = c("PLCG2", "MMP7", "CXCL1", "IL32", 
+                                              "CCL2", "SAA1"),
+                 "goblet" = c("MUC2", "MUC6", "ZG16", "SPINK4", "ATOH1", "TFF3"),
+                 "paneth" = c("LYZ", "PLA2G2A", "DEF6"),
+                 "endocrine" = c("CHGA", "CHGB", "REG4", "NEUROD1", "PYY", "NTS", "GCG"),
+                 "tuft" = c("DCLK1", "TRPM5", "RGS13", "PTGS1"),
+                 "M cells" = c("GP2", "SPIB"),
+                 "SARS-CoV-2" = c("ACE2", "TMPRSS2", "TMPRSS4", "DPP4", "CTSL"))
+
+iwalk(seu_tissue_int, function(seu, name) {
+  p <- DotPlot(seu, features = features) + 
+    RotatedAxis() + 
+    theme(text = element_text(size=8), axis.text.x = element_text(size=8))
+  ggsave(file.path(out_dir, 
+                   paste0(name, "_DotPlot_int_clus.res", clus_res, ".pdf")
+                   ),
+         plot = p,
+         width = 20, height = 6)  
+})
+
+# my feature list
+features2 <- list("stem" = c("CCL25","LGR5","CDCA7","MYC","OLFM4","RGMB", "ASCL2"),
+                  "cc_s" = c( "MCM5","PCNA","RRM1","FEN1","MCM4"),
+                  "cc_g2_m" = c("HMGB2","CDK1","NUSAP1","UBE2C","BIRC5"),
+                  "immature enterocytes" = c("CKB","NEAT1","PHGR1","PLCG2","CXCL1","CCL2"),
+                  "enterocyte" = c("RBP2","ANPEP","DGAT1","FABP2","APOB","KHK",
+                                   "APOA4","FABP1", "KRT19", "KRT20"),
+                  "goblet" = c("MUC2","CLCA1","SPINK4","BCAS1","ATOH1","ZG16","TFF3"),
+                  "paneth" = c("LYZ", "PLA2G2A","DEFA5","DEFA6","REG3A"),
+                  "endocrine" = c("OR51E1","CDHR3","KCTD12","RAB3C","CHGB","REG4","NEUROD1","PYY"),
+                  "tuft" = c("SH2D6","LRMP","FYB1","PSTPIP2","TRPM5","RGS13","PTGS1"),
+                  "SARS-CoV-2" = c("ACE2", "TMPRSS2", "TMPRSS4", "DPP4", "CTSL")
+                  )
+iwalk(seu_tissue_int, function(seu, name) {
+  p <- DotPlot(seu, features = features2) + 
+    RotatedAxis() + 
+    theme(text = element_text(size=8), axis.text.x = element_text(size=8))
+  ggsave(file.path(out_dir, 
+                   paste0(name, "_DotPlot_list2_int_clus.res", clus_res, ".pdf")
+                   ),
+         plot = p,
+         width = 20, height = 6)  
+})
+```
+Ileum:
+Warning: Found the following features in more than one assay, excluding the default. We will not include these in the final data frame: LGR5, LGR4, SOX9, EEF1B2, EEF1A1, PDZK1IP1, VIL1, CEACAM7, LAMA3, ABCB1, SCD, MMP7, SAA1, MUC6, DCLK1, GP2, ACE2, TMPRSS2, TMPRSS4
+Warning: Could not find CCL2 in the default search locations, found in RNA assay instead
+
+Rectum:
+Warning: Found the following features in more than one assay, excluding the default. We will not include these in the final data frame: LGR5, LGR4, SOX9, EEF1B2, EEF1A1, C1QBP, CCND2, PDZK1IP1, NPM1, ALPI, VIL1, APOB, RBP2, SCD, MMP7, SAA1, MUC6, CHGA, NTS, DCLK1, GP2, ACE2, TMPRSS4, DPP4, CTSL
+
+# process ileum only
+(rectum cell types are positioned in unstandard relationships in the UMAP)
+
+```{r annotate clusters}
+clusters_recode <- c("3" = "stem cells",
+                     "11" = "TA cells",
+                     "10" = "immature enterocytes-1",
+                     "12" = "immature enterocytes-2",
+                     "7" = "enterocytes",
+                     "2" = "enterocytes_1",
+                     "20" = "enterocytes-M cells",
+                     "0" = "goblet-1",
+                     "6" = "goblet-2",
+                     "24" = "goblet-3",
+                     "8" = "goblet-4",
+                     "13" = "goblet-5",
+                     "19" = "paneth",
+                     "18" = "tuft",
+                     "14" = "endocrine-1",
+                     "17" = "endocrine-2",
+                     "1" = "undefined-1",
+                     "5" = "undefined-2",
+                     "9" = "undefined-3",
+                     "15" = "undefined-4",
+                     "4" = "undefined-5",
+                     "16" = "undefined-6",
+                     "21" = "undefined-7",
+                     "22" = "undefined-8",
+                     "23" = "undefined-9"
+                     )
+seu_int_ileum <- seu_tissue_int$ileum
+seu_int_ileum$cell.type <- factor(clusters_recode[levels(
+  seu_int_ileum$integrated_snn_res.0.5
+  )[seu_int_ileum$integrated_snn_res.0.5]],
+  levels = clusters_recode)
+Idents(seu_int_ileum) <- "cell.type"
+
+DimPlot(seu_int_ileum, group.by = "cell.type", shuffle = T, label = T)
+ggsave(file.path(out_dir, "ileum_cell.type.pdf"),
+       width = 10, height = 8)
+
+# cell type by HIV status 
+summary <- seu_int_ileum[[]] %>%
+  group_by(cell.type, hiv) %>%
+  summarize(count = n()) %>%
+  pivot_wider(values_from = count, names_from = hiv, values_fill = 0)
+
+write.xlsx(summary, 
+           file.path(out_dir, 
+                     paste0("summary_ileum_cell.type_hiv_clus.res", clus_res, ".xlsx")
+                     ),
+           overwrite = T
+           )
+```
+
+
+```{r differential test: annotation by HIV status}
+ids <- levels(seu_int_ileum$cell.type)
+names(ids) <- ids
+de_results <- map(ids, ~ FindMarkers(seu_int_ileum, 
+                                     min.pct = 0.2,
+                                     ident.1 = "HIV+", ident.2 = "HIV-", 
+                                     assay = "SCT",
+                                     group.by = "hiv", 
+                                     subset.ident = .x
+                                     )
+                  )
+# save DE results and object
+write.xlsx(de_results, 
+           file.path(out_dir, paste0("de_results_ileum.xlsx")), 
+           rowNames = T
+           )
+saveRDS(de_results, file.path(object_dir, "de_results_seu_int_ileum.Rds"))
+
+# ROC test
+de_results_roc <- map(ids, ~ FindMarkers(seu_int_ileum, 
+                                     min.pct = 0.2,
+                                     test.use = "roc",
+                                     ident.1 = "HIV+", ident.2 = "HIV-", 
+                                     assay = "SCT",
+                                     group.by = "hiv", 
+                                     subset.ident = .x
+                                     )
+                  )
+# save DE results and object
+write.xlsx(de_results_roc, 
+           file.path(out_dir, paste0("de_results_roc_ileum.xlsx")), 
+           rowNames = T
+           )
+saveRDS(de_results, file.path(object_dir, "de_results_roc_seu_int_ileum.Rds"))
+```
+
+Results from Wilcoxon test (default) and ROC are very consistent
+-> use Wilcoxon
+
+```{r examine a few differentially expressed genes}
+cell_types_use <- set_names(c("stem cells", "enterocytes_1", "goblet-1", "goblet-2"))
+DefaultAssay(seu_int_ileum) <- "SCT"
+# violin plots
+top_n_genes <- 8
+feature_list <- map(cell_types_use, ~ rownames(de_results[[.x]])[1:top_n_genes])
+iwalk(feature_list, function(feats, name) {
+  pdf(file.path(out_dir, paste0("VlnPlt_de_results_ileum_", name, ".pdf")),
+      width = 11, height = 8.5
+      )
+  walk(feats, ~ print(VlnPlot(seu_int_ileum, 
+                              features = .x, 
+                              group.by = "cell.type", 
+                              assay = "SCT",
+                              split.by = "hiv", 
+                              split.plot = TRUE, 
+                              pt.size = 0.1
+                              )
+                      )
+       )
+  dev.off()
+  })
+# feature plots
+top_n_genes <- 4
+feature_list <- map(cell_types_use, ~ rownames(de_results[[.x]])[1:top_n_genes])
+iwalk(feature_list, function(feats, name) {
+  range <- rowQuantiles(GetAssayData(seu_int_ileum, assay = "SCT", slot = "data"), 
+                        rows = feats,
+                        probs = c(0.0, 1),
+                        useNames = T)
+  # range is duplicated because we are plotting for 2 conditions
+  range <- rbind(range, range)  
+  range <- as.data.frame(t(range))
+  p <- FeaturePlot(seu_int_ileum, 
+                   features = feats, 
+                   split.by = "hiv",
+                   combine = F
+                   )
+  p <- map2(p, range, function(x, y) {
+    cat(y)
+    x + scale_color_gradient(low = "lightgrey", high = "blue",
+                             limits = c(y[1], y[2])
+                             )
+    })
+  ggsave(file.path(out_dir, paste0("FeaturePlt_de_results_ileum_", name, ".pdf")),
+         plot = wrap_plots(p, ncol = 4),
+         width = 12, height = 5.5
+         )
+  })
+```
+
+-------------- MNN integration
+
+```{r integrate with fastMNN}
+seu_2_mnn <- map(seu_tissue_l, function(x) {
+  merge(x[[1]], x[-1]) %>%
+  SplitObject()  
+})
+
+ndims <- 28
+seu_mnn_l <- map(seu_tissue_l, function(x) {
+  RunFastMNN(object.list = x,
+             assay = "SCT", 
+             BPPARAM = BiocParallel::MulticoreParam())
+  })
+
+
+out <- FindNeighbors(out, reduction = "mnn", dims = 1:ndims) %>%
+  FindClusters() %>%
+  RunUMAP(reduction = "mnn", dims = 1:ndims)
+```
+

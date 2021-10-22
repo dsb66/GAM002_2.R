@@ -1,0 +1,357 @@
+---
+title: "1 - pre-processing"
+author: "DB"
+date: "2/11/2021"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+** IMPORTANT WHEN USING DATA FROM kallisto bustools **
+Before running this, make sure that gene names have been changed from ENSEMBLE IDs
+to gene names (hgnc or mgi).
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(BUSpaRse)
+library(Matrix)
+library(DropletUtils)
+library(patchwork)
+library(tidyverse)
+theme_set(theme_bw())
+data_dir <- ("../kb")
+out_dir <- ("results/QC/")
+object_dir <- "objects"
+if (!file.exists(out_dir)) {
+  dir.create(out_dir, recursive = T)
+}
+if (!file.exists(object_dir)) {
+  dir.create(object_dir)
+}
+# extract sample names from kallisto bustools output
+sample_key <- "D2"
+samples <- list.dirs(data_dir, recursive = F, full.names = F)
+samples <- samples[grep(sample_key, samples)]
+samples <- setNames(samples, samples)
+```
+
+
+```{r read data}
+mat_l <- map(samples, ~read_count_output(
+  file.path(data_dir, ., "counts_unfiltered"),
+  "cells_x_genes",
+  tcc = FALSE)
+  )
+nsamples <- length(mat_l)
+```
+
+for knee_plot see:
+https://rdrr.io/bioc/BUSpaRse/man/knee_plot.html
+
+```{r knee plots}
+df_kp_l <- imap(mat_l, function(mat, y) {
+  df_kp <- tibble(total = colSums(mat)) %>%
+    arrange(desc(total)) %>%
+    rowid_to_column(var = "rank")
+})
+
+p <- imap(df_kp_l, function(df_kp, y) {
+  ggplot(df_kp, aes(total, rank)) +
+    geom_path() +
+    scale_x_log10() + scale_y_log10() + annotation_logticks() +
+    labs(x = "Total UMI count", y = "Barcode rank") + 
+    ggtitle(samples[y])
+  })
+ncols <- 2
+ggsave(file.path(out_dir, paste0("KneePlot.pdf")), 
+       wrap_plots(p, ncol = ncols),
+       width =11, height = 5 * ceiling(nsamples/ncols)
+       )
+```
+
+
+DropletUtils parameters:
+ignore: minimum number of UMI for a real cell, DEFAULT = NULL
+lower: DEFAULT = 100
+
+```{r find valid cells with DropletUtils}
+# Parameters
+version <- 1
+niters <- 100000 # DEFAULT: 10000
+FDR_thr <- 0.0005
+lower <- 100
+par_l <- list("D22_ileum" = c("FDR_thr" = FDR_thr, "lower" = lower),
+              "D22_rectum" = c("FDR_thr" = FDR_thr, "lower" = lower),
+              "D23_ileum" = c("FDR_thr" = FDR_thr, "lower" = lower),
+              "D23_rectum" = c("FDR_thr" = FDR_thr, "lower" = lower),
+              "D24_ileum" = c("FDR_thr" = FDR_thr, "lower" = lower),
+              "D24_rectum" = c("FDR_thr" = FDR_thr, "lower" = 500),
+              "D25_ileum" = c("FDR_thr" = FDR_thr, "lower" = lower),
+              "D25_rectum" = c("FDR_thr" = FDR_thr, "lower" = lower),
+              "D26_ileum" = c("FDR_thr" = FDR_thr, "lower" = lower),
+              "D26_rectum" = c("FDR_thr" = FDR_thr, "lower" = lower),
+              "D27_ileum" = c("FDR_thr" = FDR_thr, "lower" = lower),
+              "D27_rectum" = c("FDR_thr" = FDR_thr, "lower" = lower)
+              )
+set.seed(100000)
+options(repr.plot.width=9, repr.plot.height=6)
+
+pdf(file.path(out_dir, paste0("EmptyDrops_v.", version, ".pdf")), 
+    width = 10.5, height = 8)
+filt_data <- imap(mat_l, function(mat, y) {
+  pars <- par_l[[y]]
+  lower = pars["lower"]
+  FDR_thr = pars["FDR_thr"]
+  # Find empty droplets with DropletUtils
+  cat("\n## Sample:", y, "\n")
+  e_out <- emptyDrops(mat, BPPARAM=BiocParallel::MulticoreParam(), 
+                      niters,
+                      lower = lower
+                      )
+  is_cell <- e_out$FDR <= FDR_thr
+  cell_pos <- sum(is_cell, na.rm=TRUE)
+  cat("Cells:", cell_pos, "\n\n")
+  print(table(Limited=e_out$Limited, Significant=is_cell))
+  e_out$FDR[is.na(e_out$FDR)] <- 1
+
+  # Plot of total count against the negative log-probability
+  df <- data.frame("Total" = e_out$Total, 
+                   "LogProb" = -e_out$LogProb, 
+                   "Cell" = is_cell)
+  df <- df[!is.na(df$Cell), ]
+  du_p <- ggplot(df, aes(Total, LogProb, color = Cell)) + 
+    geom_point(show.legend = FALSE) +
+    scale_x_log10() + annotation_logticks(sides = "b") +
+    labs(x = "Total UMI count", y = "-Log Probability")
+
+  print(du_p + plot_annotation(
+    title = samples[y], 
+    subtitle = paste0("Cells: ", cell_pos, 
+                      ", FDR: ", FDR_thr,
+                      ", lower: ", lower
+                      )
+    )
+  )
+  
+  return(e_out$FDR <= FDR_thr)
+})
+dev.off()
+```
+
+## Sample: D22_ileum 
+Cells: 15009 
+
+       Significant
+Limited FALSE  TRUE
+  FALSE 20286   391
+  TRUE      0 14618
+
+## Sample: D22_rectum 
+Cells: 10887 
+
+       Significant
+Limited FALSE  TRUE
+  FALSE 40856     0
+  TRUE      0 10887
+
+## Sample: D23_ileum 
+Cells: 13509 
+
+       Significant
+Limited FALSE  TRUE
+  FALSE  8356    88
+  TRUE      0 13421
+
+## Sample: D23_rectum 
+Cells: 12672 
+
+       Significant
+Limited FALSE  TRUE
+  FALSE  8075   217
+  TRUE      0 12455
+
+## Sample: D24_ileum 
+Cells: 15136 
+
+       Significant
+Limited FALSE  TRUE
+  FALSE  7519   268
+  TRUE      0 14868
+
+## Sample: D24_rectum 
+Cells: 10748 
+
+       Significant
+Limited FALSE  TRUE
+  FALSE  5003   314
+  TRUE      0 10434
+
+## Sample: D25_ileum 
+Cells: 10884 
+
+       Significant
+Limited FALSE  TRUE
+  FALSE  7554    79
+  TRUE      0 10805
+
+## Sample: D25_rectum 
+Cells: 12125 
+
+       Significant
+Limited FALSE  TRUE
+  FALSE 15671    68
+  TRUE      0 12057
+
+## Sample: D26_ileum 
+Cells: 21982 
+
+       Significant
+Limited FALSE  TRUE
+  FALSE 10102   397
+  TRUE      0 21585
+
+## Sample: D26_rectum 
+Cells: 14319 
+
+       Significant
+Limited FALSE  TRUE
+  FALSE 27614     0
+  TRUE      0 14319
+
+## Sample: D27_ileum 
+Cells: 12597 
+
+       Significant
+Limited FALSE  TRUE
+  FALSE  7545   162
+  TRUE      0 12435
+
+## Sample: D27_rectum 
+Cells: 10142 
+
+       Significant
+Limited FALSE  TRUE
+  FALSE 16863     0
+  TRUE      0 10142
+
+
+```{r FILTER matrix: use emptyDrops results OR knee plot to set threshold}
+mat_l_filt <- map2(mat_l, filt_data, ~ .x[, .y])
+```
+
+filter cells that express too few UMI (RNA counts)
+```{r distribution of number of detected UMIs per cell}
+p <- imap(mat_l_filt, function(x, y) {
+  counts <- data.frame("log_UMI" = log10(colSums(x)))
+  p <- ggplot(counts, aes(log_UMI)) +
+    geom_histogram(bins = 80) + 
+    scale_x_continuous(n.breaks = 14) +
+    ggtitle(samples[y])
+  })
+ggsave(file.path(out_dir, "DropletUtils_UMI_histogram.pdf"), 
+       wrap_plots(p, ncol = 1),
+       width = 8, height = 3*nsamples, units = "in")
+```
+
+```{r  set filter after inspecting UMI histogram}
+# set the exponent of the UMI filter (read directly from the UMI histogram)
+log_umi_thr <- 2.75
+umi_filt <- set_names(rep(log_umi_thr, nsamples), nm = names(mat_l))
+# customize threshold for individual samples if needed
+umi_filt["D23_ileum"] <- 2.6
+umi_filt["D23_rectum"] <- 2.8
+umi_filt["D24_ileum"] <- 2.5
+umi_filt["D25_ileum"] <- 2.85
+umi_filt["D25_rectum"] <- 2.6
+umi_filt["D26_ileum"] <- 2.85
+umi_filt["D27_ileum"] <- 3.0
+umi_filt["D27_rectum"] <- 2.9
+umi_filt <- 10**umi_filt
+umi_filt
+
+mat_l_filt2 <- map2(mat_l_filt, umi_filt, ~ .x[, colSums(.x) > .y])
+p <- imap(mat_l_filt2, function(x, y) {
+  counts <- data.frame("log_UMI" = log10(colSums(x)))
+  p <- ggplot(counts, aes(log_UMI)) +
+    geom_histogram(bins = 80) + scale_x_continuous(n.breaks = 14) +
+    ggtitle(samples[y])
+  })
+ggsave(file.path(out_dir, "DropletUtils_UMI_histogram_filt.pdf"), 
+       wrap_plots(p, ncol = 1),
+       width = 8, height = 3*nsamples, units = "in")
+```
+
+filter cells that express too few or too many genes (features counts)
+
+the p vector of each dcgMatrix contains the incremental sum of the number of 
+non-empty rows in each column (ie number of genes per cell)
+```{r distribution of number of detected genes per cell}
+breaks <- 10
+tx_size <- 9
+ncol <- 1
+
+gene_counts <- map(mat_l_filt2, function(x) {
+  l <- length(x@p)
+  x@p[2:l] - x@p[1:l-1]
+})
+
+p <- imap(gene_counts, function(x, y) {
+  x <- data.frame("genes_per_cell" = x)
+  ggplot(x, aes(genes_per_cell)) +
+    geom_histogram(bins = 80) + 
+    scale_x_continuous(n.breaks = breaks) +
+    theme(text = element_text(size=tx_size)) +
+    ggtitle(y)
+  })  
+ggsave(file.path(out_dir, "DropletUtils_genes_histogram.pdf"), 
+       wrap_plots(p, ncol = ncol),
+       width = 8, height = 3*nsamples, units = "in")
+```
+
+```{r set filter after inspecting gene count histogram}
+filt_low <- 0
+gene_filt_low <- set_names(rep(filt_low, nsamples), nm = names(mat_l))
+gene_filt_low
+
+filt_hi <- 7000
+gene_filt_hi <- set_names(rep(filt_hi, nsamples), nm = names(mat_l))
+gene_filt_hi["D24_rectum"] <- 4000
+gene_filt_hi["D25_ileum"] <- 8000
+gene_filt_hi
+
+mat_l_filt3 <- imap(mat_l_filt2, ~ .x[, gene_counts[[.y]] > gene_filt_low[.y] &
+                                        gene_counts[[.y]] < gene_filt_hi[.y]])
+
+gene_counts_filt <- map(mat_l_filt3, function(x) {
+  l <- length(x@p)
+  x@p[2:l] - x@p[1:l-1]
+})
+
+p <- imap(gene_counts_filt, function(x, y) {
+  x <- data.frame("genes_per_cell" = x)
+  ggplot(x, aes(genes_per_cell)) +
+    geom_histogram(bins = 80) + 
+    scale_x_continuous(n.breaks = breaks) +
+    theme(text = element_text(size=tx_size)) +
+    ggtitle(y)
+  })  
+ggsave(file.path(out_dir, "DropletUtils_genes_histogram_filt.pdf"), 
+       wrap_plots(p, ncol = ncol),
+       width = 8, height = 3*nsamples, units = "in")
+```
+
+```{r remove genes that are not expressed in any cell}
+mat_l_filt3 <- map(mat_l_filt3, ~ .x[rowSums(.x) > 0, ])
+```
+
+```{r create and save Seurat objects and cell IDs}
+# write valid cell IDs for demux
+cell_ids <- map(mat_l_filt3, colnames)
+iwalk(cell_ids, ~ write.table(.x, file = file.path(object_dir, 
+                                                   paste0("cell_ids_", .y, ".txt")),
+                              quote = F, row.names = F, col.names = F))
+
+seu_l <- imap(mat_l_filt3, ~Seurat::CreateSeuratObject(.x, project = samples[.y]))
+saveRDS(seu_l, file.path(object_dir, "seu_list.after_preprocessing.Rds"))
+```
+
